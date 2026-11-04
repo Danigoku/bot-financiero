@@ -1,5 +1,5 @@
 # ============================================================
-#  🤖 BOT FINANCIERO — VERSIÓN FINAL (MAGIA SIN COMANDOS)
+#  🤖 BOT FINANCIERO — VERSIÓN DEFINITIVA (MAGIA + REPORTES)
 # ============================================================
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
@@ -7,7 +7,6 @@ import logging
 import datetime
 import requests
 import os
-import re
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
@@ -44,7 +43,7 @@ def finnhub_quote(ticker: str) -> dict:
 
 def finnhub_noticias(ticker: str, limite: int = 3) -> list:
     hoy = datetime.date.today()
-    desde = hoy - datetime.timedelta(days=7) # Ampliado a 7 días para más margen
+    desde = hoy - datetime.timedelta(days=7) # Ampliado a 7 días
     url = "https://finnhub.io/api/v1/company-news"
     params = {
         "symbol": ticker,
@@ -111,8 +110,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Puedes hablarme normal, por ejemplo:\n"
         "👉 _\"Dame las noticias de Apple\"_\n"
         "👉 _\"¿Cómo va Tesla hoy?\"_\n\n"
-        "O usar comandos:\n"
-        "• /listo → Vigilancia automática.\n"
+        "Comandos útiles:\n"
+        "• /listo → Vigilancia automática cada hora.\n"
+        "• /reporte HH:MM → Enviar reporte a hora exacta (ej. /reporte 15:40).\n"
         "• /predecir TICKER → Análisis profundo.",
         parse_mode="Markdown"
     )
@@ -143,6 +143,43 @@ async def parar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Activa" if job_vigilancia else "💤 Detenida")
 
+# --- NUEVO COMANDO DE REPORTE ---
+async def agendar_reporte(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ Uso correcto: `/reporte 15:40` (formato 24h).")
+        return
+    hora_texto = context.args[0]
+    try:
+        partes = hora_texto.split(":")
+        hora = int(partes[0])
+        minuto = int(partes[1])
+        
+        # Usa hora UTC del servidor
+        ahora = datetime.datetime.now(datetime.timezone.utc)
+        objetivo = ahora.replace(hour=hora, minute=minuto, second=0, microsecond=0)
+        
+        if objetivo < ahora:
+            objetivo += datetime.timedelta(days=1)
+            
+        espera = (objetivo - ahora).total_seconds()
+        context.job_queue.run_once(tarea_reporte_agendado, when=espera, chat_id=update.effective_chat.id)
+        
+        await update.message.reply_text(f"✅ ¡Entendido! Te mandaré un reporte a las {hora_texto} (hora del servidor).")
+    except Exception as e:
+        await update.message.reply_text("❌ Formato incorrecto. Usa `/reporte 15:40`.")
+
+async def tarea_reporte_agendado(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    await context.bot.send_message(chat_id=chat_id, text="📊 *Aquí está tu reporte programado:*", parse_mode="Markdown")
+    for t in TICKERS_VIGILAR:
+        try:
+            q = finnhub_quote(t)
+            precio = q.get("c", 0)
+            cambio = q.get("dp", 0)
+            await context.bot.send_message(chat_id=chat_id, text=f"📈 {t}: ${precio} ({cambio:+.2f}%)")
+        except Exception:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Error con {t}")
+
 async def predecir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ Uso: /predecir AAPL")
@@ -166,23 +203,22 @@ async def noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if notis and "No se pudieron cargar" not in notis[0]:
             mensaje = f"📰 *Noticias {t}:*\n\n" + "\n".join(notis)
         else:
-            mensaje = f"📰 No encontré noticias de {t} en la base de datos, pero puedo analizar el precio si usas /predecir {t}."
+            prompt = f"Dame un resumen breve de las noticias y situación actual de la empresa {t}."
+            respuesta_ia = consultar_deepseek(prompt)
+            mensaje = f"📰 *Noticias {t} (resumen IA):*\n\n{respuesta_ia}"
         await update.message.reply_text(mensaje, parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text("❌ Error buscando noticias.")
 
 # ============================================================
-#  🗣️ CHAT LIBRE INTELIGENTE (Detecta noticias sin comandos)
+#  🗣️ CHAT LIBRE INTELIGENTE (Sin comandos)
 # ============================================================
 async def chat_libre(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto_usuario = update.message.text
     mensaje_espera = await update.message.reply_text("🤔 Déjame revisar...")
     
-    # Diccionario de empresas comunes para detectar de qué habla el usuario
     empresas = {
-        "apple": "AAPL", "manzana": "AAPL",
-        "tesla": "TSLA", 
-        "nvidia": "NVDA",
+        "apple": "AAPL", "manzana": "AAPL", "tesla": "TSLA", "nvidia": "NVDA",
         "microsoft": "MSFT", "google": "GOOGL", "amazon": "AMZN",
         "meta": "META", "facebook": "META", "netflix": "NFLX"
     }
@@ -190,13 +226,11 @@ async def chat_libre(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto_min = texto_usuario.lower()
     ticker_encontrado = None
     
-    # Buscar si mencionó alguna empresa
     for nombre, ticker in empresas.items():
         if nombre in texto_min:
             ticker_encontrado = ticker
             break
             
-    # Si menciona una empresa y pide noticias, vamos a Finnhub
     if ticker_encontrado and ("noticia" in texto_min or "pasa" in texto_min or "nueva" in texto_min):
         try:
             notis = finnhub_noticias(ticker_encontrado, 3)
@@ -207,7 +241,6 @@ async def chat_libre(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    # Si no es noticia o falla, usa la IA normal
     prompt = (
         f"El usuario me dice: '{texto_usuario}'\n\n"
         "Respóndele como un asistente financiero amigable y experto en español. Sé conciso."
@@ -222,7 +255,7 @@ async def chat_libre(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await mensaje_espera.edit_text("❌ Tuve un problema de conexión al pensar.")
 
 # ============================================================
-#  ⏰ TAREA AUTOMÁTICA
+#  ⏰ TAREA AUTOMÁTICA (Cada hora)
 # ============================================================
 async def tarea_vigilancia(context: ContextTypes.DEFAULT_TYPE):
     if CHAT_ID is None:
@@ -268,8 +301,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("estado", estado))
     app.add_handler(CommandHandler("predecir", predecir))
     app.add_handler(CommandHandler("noticias", noticias))
+    app.add_handler(CommandHandler("reporte", agendar_reporte))
     
-    # Aquí está la magia: el chat libre ahora intercepta las noticias
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_libre))
     
     app.run_polling()
