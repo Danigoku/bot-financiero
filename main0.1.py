@@ -20,10 +20,18 @@ API_KEY_DEEPSEEK = os.environ.get("API_KEY_DEEPSEEK", "")
 FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")
 
 # ============================================================
-#  ⚙️ CONFIGURACIÓN
+#  ⚙️ CONFIGURACIÓN Y ZONA HORARIA (-6 CENTRAL)
 # ============================================================
 TICKERS_VIGILAR = ["AAPL", "TSLA", "NVDA"]
 UMBRAL_CAMBIO_PCT = 3.0
+
+# 🚨 AQUÍ ESTÁ TU HORARIO: -6 (EE.UU. Central) 🚨
+ZONA_HORARIA_OFFSET = -6 
+
+def obtener_hora_local():
+    """Devuelve la hora actual según el horario de -6"""
+    tz = datetime.timezone(datetime.timedelta(hours=ZONA_HORARIA_OFFSET))
+    return datetime.datetime.now(tz)
 
 CHAT_ID = None
 job_vigilancia = None
@@ -59,13 +67,13 @@ def finnhub_noticias(ticker: str, limite: int = 3) -> list:
 # ============================================================
 #  🧠 FUNCIONES DE IA
 # ============================================================
-def consultar_deepseek(prompt: str) -> str:
+def consultar_deepseek(prompt: str, system_prompt: str = "Eres un analista financiero experto y amigable. Responde en español, de forma clara y profesional.") -> str:
     url = "https://api.deepseek.com/chat/completions"
     headers = {"Authorization": f"Bearer {API_KEY_DEEPSEEK}", "Content-Type": "application/json"}
     payload = {
         "model": "deepseek-chat",
         "messages": [
-            {"role": "system", "content": "Eres un analista financiero experto y amigable. Responde en español, de forma clara y profesional."},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
     }
@@ -74,41 +82,64 @@ def consultar_deepseek(prompt: str) -> str:
     return r.json()["choices"][0]["message"]["content"]
 
 # ============================================================
-#  🧠 EL CEREBRO CENTRAL (Decide qué hacer con CUALQUIER mensaje)
+#  🧠 EL CEREBRO CENTRAL
 # ============================================================
 async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Agarramos el texto del usuario (si es un comando, quitamos la barra)
     texto = update.message.text
     if texto.startswith('/'):
         texto = texto.split(' ', 1)[1] if ' ' in texto else texto.replace('/', '')
     
     if not texto.strip():
-        await update.message.reply_text("⚠️ No entendí tu mensaje. ¿Puedes repetirlo?")
+        await update.message.reply_text("⚠️ No entendí tu mensaje.")
         return
 
     mensaje_espera = await update.message.reply_text("🤔 Analizando...")
 
-    # 1. La IA clasifica qué quiere el usuario
-    prompt_clasificador = (
-        f"Analiza este mensaje: '{texto}'\n\n"
-        "Responde SOLO con un formato JSON con las claves:\n"
-        '{"accion": "noticias" | "precio" | "charla", "ticker": "AAPL" o "null"}\n'
-        "- Si pide noticias, novedades, qué pasa con una empresa -> accion: 'noticias'\n"
-        "- Si pide precio, cómo va la acción, análisis -> accion: 'precio'\n"
-        "- Si es un saludo o charla general -> accion: 'charla'\n"
-        "Identifica el ticker en base a nombres (Apple -> AAPL, Tesla -> TSLA, etc)."
+    system_prompt_clasificador = (
+        "Eres un clasificador de intenciones. El usuario te dará un texto y debes devolver ÚNICAMENTE un objeto JSON válido, sin texto adicional. "
+        "El JSON debe tener exactamente estas claves: "
+        '{"accion": "noticias" | "precio" | "hora" | "reporte" | "charla", "ticker": "AAPL" o "null", "hora_texto": "15:40" o "null"}\n'
+        "- 'noticias': si pide información o novedades de una empresa.\n"
+        "- 'precio': si pide precio o análisis técnico.\n"
+        "- 'hora': si pregunta la hora actual.\n"
+        "- 'reporte': si pide que le avises a una hora específica (extrae la hora en formato 24h HH:MM).\n"
+        "- 'charla': cualquier otra cosa."
     )
+
+    prompt_clasificador = f"Texto del usuario: '{texto}'"
     
     try:
-        respuesta_json_str = consultar_deepseek(prompt_clasificador)
+        respuesta_json_str = consultar_deepseek(prompt_clasificador, system_prompt_clasificador)
         respuesta_json_str = respuesta_json_str.replace("```json", "").replace("```", "").strip()
         clasificacion = json.loads(respuesta_json_str)
         
         accion = clasificacion.get("accion")
         ticker = clasificacion.get("ticker")
+        hora_texto = clasificacion.get("hora_texto")
 
-        # 2. ACTUAR SEGÚN LO QUE DIJO LA IA
-        if accion == "noticias" and ticker and ticker != "null":
+        if accion == "hora":
+            ahora = obtener_hora_local().strftime("%I:%M %p")
+            await mensaje_espera.delete()
+            await update.message.reply_text(f"🕒 La hora actual es: {ahora} (Hora del Centro de EE.UU.).")
+            return
+
+        elif accion == "reporte" and hora_texto:
+            try:
+                h, m = map(int, hora_texto.split(":"))
+                ahora = obtener_hora_local()
+                objetivo = ahora.replace(hour=h, minute=m, second=0, microsecond=0)
+                if objetivo < ahora: objetivo += datetime.timedelta(days=1)
+                
+                espera = (objetivo - ahora).total_seconds()
+                context.job_queue.run_once(tarea_reporte_agendado, when=espera, chat_id=update.effective_chat.id)
+                
+                await mensaje_espera.delete()
+                await update.message.reply_text(f"✅ ¡Entendido! Te mandaré un reporte a las {hora_texto} (tu hora local).")
+            except ValueError:
+                await mensaje_espera.edit_text("❌ No entendí la hora. Intenta decir 'Avísame a las 15:40'.")
+            return
+
+        elif accion == "noticias" and ticker and ticker != "null":
             notis = finnhub_noticias(ticker, 3)
             if notis and "No se pudieron cargar" not in notis[0]:
                 await mensaje_espera.delete()
@@ -130,17 +161,20 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📊 *Análisis de {ticker}:*\n\n{analisis}", parse_mode="Markdown")
             return
 
-        # 3. Si es charla normal o no detectó nada específico
         respuesta = consultar_deepseek(f"Responde amigablemente a esto: '{texto}'")
         await mensaje_espera.delete()
         await update.message.reply_text(respuesta)
 
+    except json.JSONDecodeError:
+        respuesta = consultar_deepseek(f"Responde amigablemente a esto: '{texto}'")
+        await mensaje_espera.delete()
+        await update.message.reply_text(respuesta)
     except Exception as e:
         logging.error(f"Error en procesar_mensaje: {e}")
-        await mensaje_espera.edit_text("❌ Lo siento, tuve un problema de conexión al pensar. Intenta de nuevo.")
+        await mensaje_espera.edit_text("❌ Lo siento, tuve un problema de conexión al pensar.")
 
 # ============================================================
-#  🤖 COMANDOS ESPECÍFICOS (Para reportes y configuración)
+#  🤖 COMANDOS Y TAREAS
 # ============================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CHAT_ID
@@ -149,29 +183,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 ¡Hola! Soy tu asistente financiero.\n\n"
         "Háblame como quieras, entiendo todo:\n"
         "👉 _\"Dame noticias de Apple\"_\n"
-        "👉 _\"¿Cómo va Tesla?\"_\n"
-        "👉 _\"Hola, ¿qué tal?\"_\n\n"
+        "👉 _\"¿Qué hora es?\"_\n"
+        "👉 _\"Avísame a las 15:40\"_\n\n"
         "Comandos de control:\n"
-        "• /reporte HH:MM (24h) → Reporte programado.\n"
         "• /listo → Vigilancia automática.\n"
         "• /parar → Detener vigilancia.",
         parse_mode="Markdown"
     )
-
-async def agendar_reporte(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("⚠️ Uso: `/reporte 15:40` (24h).")
-        return
-    try:
-        h, m = map(int, context.args[0].split(":"))
-        ahora = datetime.datetime.now(datetime.timezone.utc)
-        objetivo = ahora.replace(hour=h, minute=m, second=0, microsecond=0)
-        if objetivo < ahora: objetivo += datetime.timedelta(days=1)
-        espera = (objetivo - ahora).total_seconds()
-        context.job_queue.run_once(tarea_reporte_agendado, when=espera, chat_id=update.effective_chat.id)
-        await update.message.reply_text(f"✅ Reporte agendado para las {context.args[0]} (UTC).")
-    except:
-        await update.message.reply_text("❌ Usa `/reporte 15:40`.")
 
 async def tarea_reporte_agendado(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
@@ -188,7 +206,7 @@ async def listo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if job_vigilancia is not None:
         await update.message.reply_text("✅ Ya estoy vigilando.")
         return
-    ahora = datetime.datetime.now()
+    ahora = obtener_hora_local()
     proxima = ahora.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
     seg = (proxima - ahora).total_seconds()
     job_vigilancia = context.job_queue.run_repeating(tarea_vigilancia, interval=3600, first=seg)
@@ -201,12 +219,6 @@ async def parar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job_vigilancia = None
     await update.message.reply_text("🛑 Vigilancia detenida.")
 
-async def estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Activa" if job_vigilancia else "💤 Detenida")
-
-# ============================================================
-#  ⏰ TAREA AUTOMÁTICA
-# ============================================================
 async def tarea_vigilancia(context: ContextTypes.DEFAULT_TYPE):
     if CHAT_ID is None: return
     alertas = []
@@ -241,14 +253,10 @@ if __name__ == "__main__":
     req = HTTPXRequest(read_timeout=30.0, connect_timeout=15.0)
     app = Application.builder().token(TOKEN_TELEGRAM).request(req).get_updates_request(req).build()
     
-    # Comandos de configuración (no pasan por el cerebro, son directos)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("listo", listo))
     app.add_handler(CommandHandler("parar", parar))
-    app.add_handler(CommandHandler("estado", estado))
-    app.add_handler(CommandHandler("reporte", agendar_reporte))
     
-    # ¡La magia! TODO lo demás pasa por el cerebro procesador
     app.add_handler(MessageHandler(filters.TEXT, procesar_mensaje))
     
     app.run_polling()
