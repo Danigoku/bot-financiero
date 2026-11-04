@@ -13,16 +13,14 @@ from telegram.request import HTTPXRequest
 # ============================================================
 #  🔑 ZONA DE CLAVES — RELLENA SOLO ESTAS 3 LÍNEAS
 # ============================================================
-
+import os
 # 👇 AQUÍ VA TU TOKEN DE TELEGRAM (lo da @BotFather)
-TOKEN_TELEGRAM = ""
-
+TOKEN_TELEGRAM = os.environ.get("TOKEN_TELEGRAM", "")
 # 👇 AQUÍ VA TU API KEY DE DEEPSEEK (empieza por sk-)
-API_KEY_DEEPSEEK = ""
+API_KEY_DEEPSEEK = os.environ.get("API_KEY_DEEPSEEK", "")
 
 # 👇 AQUÍ VA TU API KEY DE FINNHUB (la sacaste en finnhub.io)
-FINNHUB_KEY = ""
-
+FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")
 # ============================================================
 #  ⚙️ CONFIGURACIÓN
 # ============================================================
