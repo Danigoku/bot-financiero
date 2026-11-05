@@ -1,5 +1,5 @@
 # ============================================================
-#  🤖 BOT FINANCIERO — VERSIÓN FINAL (REPORTES Y SNIPER PERFECTOS)
+#  🤖 BOT FINANCIERO — VERSIÓN FINAL (GRÁFICOS Y DATOS BLINDADOS)
 # ============================================================
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
@@ -8,6 +8,7 @@ import datetime
 import requests
 import os
 import json
+import math
 import yfinance as yf
 import mplfinance as mpf
 import matplotlib
@@ -41,27 +42,38 @@ job_sniper = None
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # ============================================================
-#  📊 FUNCIONES DE DATOS
+#  📊 FUNCIONES DE DATOS (BLINDADAS CONTRA ERRORES)
 # ============================================================
 def obtener_precio(ticker: str) -> dict:
+    # 1. Intentar con Yahoo Finance
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="2d")
-        if len(hist) >= 2:
+        if not hist.empty:
             precio = hist['Close'].iloc[-1]
-            prev = hist['Close'].iloc[-2]
-            cambio = ((precio - prev) / prev) * 100
-            return {"c": round(float(precio), 2), "dp": round(float(cambio), 2)}
+            if not math.isnan(precio): # Verificar que no sea NaN
+                if len(hist) >= 2:
+                    prev = hist['Close'].iloc[-2]
+                    cambio = ((precio - prev) / prev) * 100
+                    return {"c": round(float(precio), 2), "dp": round(float(cambio), 2)}
+                else:
+                    return {"c": round(float(precio), 2), "dp": 0.0}
     except Exception as e:
-        pass
+        logging.error(f"Error YFinance {ticker}: {e}")
 
+    # 2. Intentar con Finnhub como respaldo
     try:
         url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_KEY}"
         r = requests.get(url, timeout=10)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        if data.get("c") and data.get("c") > 0: # Si Finnhub devuelve un precio real
+            return data
     except Exception as e:
-        return {"c": "N/A", "dp": 0}
+        logging.error(f"Error Finnhub {ticker}: {e}")
+    
+    # 3. Si todo falla, devolver N/D
+    return {"c": "N/D", "dp": 0.0}
 
 def finnhub_noticias(ticker: str, limite: int = 3) -> list:
     hoy = datetime.date.today()
@@ -77,16 +89,31 @@ def finnhub_noticias(ticker: str, limite: int = 3) -> list:
         return ["No se pudieron cargar noticias."]
 
 # ============================================================
-#  📉 GENERADOR DE VELAS JAPONESAS
+#  📉 GENERADOR DE VELAS JAPONESAS (ARREGLADO)
 # ============================================================
 def generar_grafico_velas(ticker: str) -> str:
     try:
-        data = yf.download(ticker, period="5d", interval="15m", progress=False)
-        if data.empty: return None
+        # Usamos Ticker().history() en lugar de download() porque es más estable en servidores
+        t = yf.Ticker(ticker)
+        data = t.history(period="5d", interval="15m")
+        
+        # Si no hay datos (fin de semana o feriado), intentamos con datos diarios
+        if data.empty:
+            data = t.history(period="1mo", interval="1d")
+            
+        if data.empty: 
+            return None
+        
+        # ¡EL TRUCO! Quitamos la zona horaria del índice (mplfinance suele fallar por esto)
+        if data.index.tz is not None:
+            data.index = data.index.tz_localize(None)
+        
         filename = f"{ticker}_chart.png"
         mc = mpf.make_marketcolors(up='g', down='r', edge='inherit', wick='inherit', volume='in')
         s  = mpf.make_mpf_style(marketcolors=mc, gridstyle=':', y_on_right=False)
-        mpf.plot(data, type='candle', style=s, title=f'{ticker} - Velas Japonesas', volume=True, savefig=filename)
+        
+        mpf.plot(data, type='candle', style=s, title=f'{ticker} - Velas Japonesas', 
+                 volume=True, savefig=filename)
         return filename
     except Exception as e:
         logging.error(f"Error gráfico {ticker}: {e}")
@@ -114,7 +141,8 @@ async def tarea_sniper(context: ContextTypes.DEFAULT_TYPE):
     for ticker in tickers:
         q = obtener_precio(ticker)
         precio_actual = q.get("c")
-        if precio_actual == "N/A": continue
+        if precio_actual == "N/D": continue
+        
         precio_anterior = context.bot_data.get(f"precio_{ticker}", precio_actual)
         
         if precio_anterior != precio_actual:
@@ -169,11 +197,9 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if job_sniper: job_sniper.schedule_removal()
             tickers_a_vigilar = [ticker] if ticker and ticker != "null" else TICKERS_VIGILAR
             tiempo_fin = obtener_hora_local() + datetime.timedelta(minutes=duracion_minutos)
-            
             job_sniper = context.job_queue.run_repeating(
                 tarea_sniper, interval=180, first=10,
-                data={"chat_id": update.effective_chat.id, "tickers": tickers_a_vigilar},
-                last=tiempo_fin
+                data={"chat_id": update.effective_chat.id, "tickers": tickers_a_vigilar}, last=tiempo_fin
             )
             await mensaje_espera.delete()
             await update.message.reply_text(f"🎯 *¡Modo Sniper Activado!*\nVigilando: {', '.join(tickers_a_vigilar)}\nTiempo límite: {duracion_minutos} min (hasta las {tiempo_fin.strftime('%I:%M %p')}).", parse_mode="Markdown")
@@ -195,17 +221,13 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif accion == "reporte" and hora_texto:
             try:
-                # Si la IA devuelve "7:30" en lugar de "07:30"
                 if ":" in hora_texto:
                     h_str, m_str = hora_texto.split(":")
                     h, m = int(h_str), int(m_str)
-                else:
-                    raise ValueError
+                else: raise ValueError
                 
                 ahora = obtener_hora_local()
                 objetivo = ahora.replace(hour=h, minute=m, second=0, microsecond=0)
-                
-                # Si la hora ya pasó hoy, se agenda para mañana
                 if objetivo < ahora: objetivo += datetime.timedelta(days=1)
                 
                 espera = (objetivo - ahora).total_seconds()
@@ -213,8 +235,8 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 await mensaje_espera.delete()
                 await update.message.reply_text(f"✅ ¡Entendido! Te mandaré el reporte a las {objetivo.strftime('%I:%M %p')}.")
-            except Exception as e:
-                await mensaje_espera.edit_text("❌ No entendí la hora. Intenta decir 'Avísame a las 19:30' (formato 24h).")
+            except Exception:
+                await mensaje_espera.edit_text("❌ No entendí la hora. Intenta decir 'Avísame a las 19:30'.")
             return
 
         elif accion == "grafico" and ticker and ticker != "null":
@@ -226,7 +248,7 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_photo(photo=photo, caption=f"📊 Velas japonesas de {ticker}.")
                 os.remove(archivo_grafico)
             else:
-                await mensaje_espera.edit_text("❌ No pude generar el gráfico.")
+                await mensaje_espera.edit_text("❌ No pude generar el gráfico. Es posible que el mercado esté cerrado o no haya datos disponibles para este ticker.")
             return
 
         elif accion == "noticias" and ticker and ticker != "null":
@@ -243,6 +265,12 @@ async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif accion in ["precio", "analisis_corto", "analisis_largo"] and ticker and ticker != "null":
             q = obtener_precio(ticker)
+            
+            # Arreglo para el NaN
+            if q.get('c') == "N/D" or isinstance(q.get('c'), float) and math.isnan(q.get('c')):
+                await mensaje_espera.edit_text(f"❌ Lo siento, no hay datos de precio disponibles para {ticker} en este momento (puede ser que el mercado esté cerrado).")
+                return
+
             notis = finnhub_noticias(ticker)
             prompt = f"Analiza {ticker} a {accion.replace('analisis_', '')} plazo. Precio: {q.get('c')}, Cambio: {q.get('dp')}%. Noticias: {', '.join(notis)}."
             analisis = consultar_deepseek(prompt)
@@ -277,16 +305,21 @@ async def tarea_reporte_agendado(context: ContextTypes.DEFAULT_TYPE):
     ticker = job.data.get("ticker")
     
     if ticker and ticker != "null":
-        await context.bot.send_message(chat_id=chat_id, text=f"⏰ *Reporte programado de {ticker}:*", parse_mode="Markdown")
         q = obtener_precio(ticker)
-        await context.bot.send_message(chat_id=chat_id, text=f"📈 {ticker}: ${q.get('c')} ({q.get('dp')}%)")
+        if q.get('c') == "N/D" or isinstance(q.get('c'), float) and math.isnan(q.get('c')):
+            await context.bot.send_message(chat_id=chat_id, text=f"⏰ *Reporte de {ticker}:* ❌ Datos no disponibles en este momento.", parse_mode="Markdown")
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=f"⏰ *Reporte programado de {ticker}:*\n📈 {ticker}: ${q.get('c')} ({q.get('dp'):+.2f}%)", parse_mode="Markdown")
     else:
         await context.bot.send_message(chat_id=chat_id, text="⏰ *Reporte General:*", parse_mode="Markdown")
         for t in TICKERS_VIGILAR:
             q = obtener_precio(t)
-            await context.bot.send_message(chat_id=chat_id, text=f"📈 {t}: ${q.get('c')} ({q.get('dp')}%)")
+            if q.get('c') != "N/D" and not math.isnan(q.get('c', 0)):
+                await context.bot.send_message(chat_id=chat_id, text=f"📈 {t}: ${q.get('c')} ({q.get('dp')}%)")
 
 async def listo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global CHAT_ID, job_vigilancia
+    CHAT_ID = update.effective_chat.id
     if job_vigilancia is not None:
         await update.message.reply_text("✅ Ya estoy vigilando.")
         return
@@ -304,14 +337,14 @@ async def parar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🛑 Vigilancia detenida.")
 
 async def tarea_vigilancia(context: ContextTypes.DEFAULT_TYPE):
-    global CHAT_ID
     if CHAT_ID is None: return
     alertas = []
     for t in TICKERS_VIGILAR:
         q = obtener_precio(t)
-        cambio = q.get("dp", 0)
-        if cambio >= UMBRAL_CAMBIO_PCT: alertas.append(f"🔴 *VENDER* {t} — subió {cambio:.2f}%")
-        elif cambio <= -UMBRAL_CAMBIO_PCT: alertas.append(f"🟢 *COMPRAR* {t} — cayó {cambio:.2f}%")
+        if q.get('c') != "N/D" and not math.isnan(q.get('c', 0)):
+            cambio = q.get("dp", 0)
+            if cambio >= UMBRAL_CAMBIO_PCT: alertas.append(f"🔴 *VENDER* {t} — subió {cambio:.2f}%")
+            elif cambio <= -UMBRAL_CAMBIO_PCT: alertas.append(f"🟢 *COMPRAR* {t} — cayó {cambio:.2f}%")
     msg = ("📢 *Señales:*\n\n" + "\n".join(alertas)) if alertas else "✅ Sin señales fuertes."
     await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
 
