@@ -1,2 +1,5 @@
 python-telegram-bot[job-queue]
 requests
+yfinance
+pandas
+mplfinance
