@@ -1,5 +1,5 @@
 # ============================================================
-#  🤖 BOT FINANCIERO — VERSIÓN FINAL (RADAR GEMINI + DEEPSEEK)
+#  🤖 BOT FINANCIERO — VERSIÓN FINAL (MENÚ INTELIGENTE + CHAT)
 # ============================================================
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
@@ -27,32 +27,22 @@ FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")
 API_KEY_GEMINI = os.environ.get("GEMINI_API_KEY", "")
 
 # Configurar cliente de Gemini
-client_gemini = genai.Client(api_key=API_KEY_GEMINI)
+try:
+    client_gemini = genai.Client(api_key=API_KEY_GEMINI)
+except Exception as e:
+    logging.error(f"Error Gemini: {e}")
+    client_gemini = None
 
-# ============================================================
-#  ⚙️ CONFIGURACIÓN Y DICCIONARIO
-# ============================================================
 ZONA_HORARIA_OFFSET = -6 
 CHAT_ID = None
 job_vigilancia = None
 
-# Lista de Élite (Lo que el bot revisará si Gemini dice que hay movimiento)
 RADAR_TICKERS = {
     "Índices": ["^GSPC", "^IXIC", "^DJI"],
-    "ETFs Top": ["SPY", "QQQ", "KBE", "XLE", "GLD"], # Mercado, Tech, Bancos, Energía, Oro
+    "ETFs Top": ["SPY", "QQQ", "KBE", "XLE", "GLD"],
     "Acciones": ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "JPM", "BAC"],
     "Cripto": ["BTC-USD", "ETH-USD", "SOL-USD"],
-    "Materias Primas": ["CL=F", "GC=F"] # Petróleo, Oro
-}
-
-DICCIONARIO_TICKERS = {
-    "s&p 500": "^GSPC", "s&p": "^GSPC", "sp500": "^GSPC",
-    "nasdaq": "^IXIC", "dow jones": "^DJI",
-    "bitcoin": "BTC-USD", "btc": "BTC-USD", 
-    "ethereum": "ETH-USD", "solana": "SOL-USD",
-    "oro": "GC=F", "petroleo": "CL=F", 
-    "apple": "AAPL", "tesla": "TSLA", "nvidia": "NVDA", 
-    "bancos": "KBE"
+    "Materias Primas": ["CL=F", "GC=F"]
 }
 
 def obtener_hora_local():
@@ -104,84 +94,53 @@ def generar_grafico_velas(ticker: str, tiempo: str = "semana") -> str:
         return None
 
 # ============================================================
-#  🚨 EL RADAR DE 3 PASOS (Gemini + Filtro + DeepSeek)
-# ============================================================
-async def tarea_radar(context: ContextTypes.DEFAULT_TYPE):
-    if CHAT_ID is None: return
-    
-    # PASO 1: Gemini investiga las noticias
-    prompt_gemini = (
-        "Actúa como un analista de Wall Street. Revisa las noticias financieras de HOY. "
-        "Dame un resumen ULTRA BREVE (máximo 3 líneas) de qué sectores están en crisis, euforia o moviéndose raro. "
-        "Menciona solo lo más importante (ej. bancos, IA, cripto, petróleo)."
-    )
-    
-    try:
-        response = client_gemini.models.generate_content(model='gemini-1.5-flash', contents=prompt_gemini)
-        contexto_noticias = response.text
-    except Exception as e:
-        logging.error(f"Error Gemini: {e}")
-        contexto_noticias = "No se pudieron cargar las noticias de última hora."
-
-    # PASO 2: Escanear la Lista de Élite (Yahoo Finance)
-    movimientos_fuertes = []
-    for categoria, tickers in RADAR_TICKERS.items():
-        for ticker in tickers:
-            q = obtener_precio(ticker)
-            if q.get('c') != "N/D":
-                cambio = q.get("dp", 0)
-                # Diferentes umbrales según el activo
-                umbral = 3.0 # Base para acciones e índices
-                if "USD" in ticker: umbral = 5.0 # Cripto se mueve más
-                if ticker in ["KBE", "^GSPC", "^IXIC"]: umbral = 1.5 # ETFs e índices se mueven menos
-                
-                if abs(cambio) >= umbral:
-                    movimientos_fuertes.append({
-                        "ticker": ticker, "precio": q.get('c'), "cambio": cambio, "categoria": categoria
-                    })
-
-    # PASO 3: DeepSeek analiza los movimientos
-    if movimientos_fuertes:
-        prompt_ds = (
-            f"El mercado tuvo estos movimientos fuertes: {json.dumps(movimientos_fuertes)}. "
-            f"Contexto de noticias (Gemini): {contexto_noticias}. "
-            "Dame un análisis breve y directo de si es oportunidad de trading (compra/venta) o riesgo de colapso."
-        )
-        analisis_ds = consultar_deepseek(prompt_ds)
-        
-        mensaje = "🚨🚨 **¡RADAR DE MERCADO DETECTADO!** 🚨🚨\n\n"
-        mensaje += f"🕵️‍♂️ *Contexto (Gemini):*\n_{contexto_noticias}_\n\n"
-        mensaje += "📊 *Movimientos Fuertes:*\n"
-        for m in movimientos_fuertes:
-            emoji = "📈" if m['cambio'] > 0 else "📉"
-            mensaje += f"{emoji} **{m['ticker']}** ({m['categoria']}): ${m['precio']} ({m['cambio']:+.2f}%)\n"
-            
-        mensaje += f"\n🧠 *Análisis (DeepSeek):*\n{analisis_ds}"
-        await context.bot.send_message(chat_id=CHAT_ID, text=mensaje, parse_mode="Markdown")
-
-# ============================================================
-#  🤖 EL MENÚ INTERACTIVO
+#  🤖 MENÚ Y CHAT
 # ============================================================
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CHAT_ID
     CHAT_ID = update.effective_chat.id
-    await update.message.reply_text("📊 **Menú**\n¿De qué activo quieres saber? (Ej. *Apple, Bitcoin, S&P 500*)", parse_mode="Markdown")
     context.user_data['esperando_ticker'] = True
+    await update.message.reply_text("📊 **Menú**\n¿De qué activo quieres saber? (Ej. *Apple, Bitcoin, S&P 500*)", parse_mode="Markdown")
 
-async def recibir_ticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('esperando_ticker'):
-        return 
+async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    texto = update.message.text
     
-    texto = update.message.text.lower().strip()
-    ticker = DICCIONARIO_TICKERS.get(texto, update.message.text.upper())
-    context.user_data['ticker_actual'] = ticker
-    context.user_data['esperando_ticker'] = False
-    
-    keyboard = [
-        [InlineKeyboardButton("📊 Gráfico Hoy", callback_data="grafico_hoy"), InlineKeyboardButton("📊 Gráfico Semana", callback_data="grafico_semana")],
-        [InlineKeyboardButton("📰 Noticias", callback_data="noticias"), InlineKeyboardButton("🧠 Análisis 360°", callback_data="analisis")]
-    ]
-    await update.message.reply_text(f"Has seleccionado: **{ticker}**\n¿Qué quieres hacer?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    # Si el bot está esperando un ticker (porque usaste el /menu)
+    if context.user_data.get('esperando_ticker'):
+        mensaje_espera = await update.message.reply_text("🔍 Identificando activo...")
+        
+        # Usamos IA para traducir frases como "Dame el S&P500" a "^GSPC"
+        prompt = f"Extrae el ticker bursátil exacto del siguiente texto: '{texto}'. Responde SOLO con el ticker (ej. AAPL, ^GSPC, BTC-USD). Si no es un activo, responde 'NULL'."
+        try:
+            ticker_limpio = consultar_deepseek(prompt).strip().upper()
+            if ticker_limpio == 'NULL' or not ticker_limpio:
+                ticker = texto.upper() # Fallback
+            else:
+                ticker = ticker_limpio
+        except:
+            ticker = texto.upper()
+
+        context.user_data['ticker_actual'] = ticker
+        context.user_data['esperando_ticker'] = False
+        
+        keyboard = [
+            [InlineKeyboardButton("📊 Gráfico Hoy", callback_data="grafico_hoy"), InlineKeyboardButton("📊 Gráfico Semana", callback_data="grafico_semana")],
+            [InlineKeyboardButton("📰 Noticias", callback_data="noticias"), InlineKeyboardButton("🧠 Análisis 360°", callback_data="analisis")]
+        ]
+        await mensaje_espera.delete()
+        await update.message.reply_text(f"Has seleccionado: **{ticker}**\n¿Qué quieres hacer?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    # SI NO ESTÁ EN EL MENÚ, HABLA NORMAL (Chat Libre)
+    mensaje_espera = await update.message.reply_text("🤔 Pensando...")
+    try:
+        # Aquí devolvemos la vida al chat normal
+        prompt = f"Responde de forma amigable y profesional (como analista financiero) a esto: '{texto}'"
+        respuesta = consultar_deepseek(prompt)
+        await mensaje_espera.delete()
+        await update.message.reply_text(respuesta)
+    except Exception as e:
+        await mensaje_espera.edit_text("❌ Tuve un problema al pensar. Intenta de nuevo.")
 
 async def botones_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -203,8 +162,7 @@ async def botones_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     elif accion == "noticias":
         await query.edit_message_text(f"📰 Buscando noticias de {ticker}...")
-        # Aquí podríamos usar Gemini, pero por rapidez usamos DeepSeek
-        prompt = f"Dame un resumen de las noticias más recientes de {ticker}."
+        prompt = f"Dame un resumen breve de las noticias más recientes de {ticker}."
         notis = consultar_deepseek(prompt)
         await query.edit_message_text(f"📰 **Noticias de {ticker}:**\n\n{notis}", parse_mode="Markdown")
         
@@ -219,7 +177,40 @@ async def botones_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"🧠 **Análisis 360° de {ticker}:**\n\n{analisis}", parse_mode="Markdown")
 
 # ============================================================
-#  ▶️ ARRANQUE Y COMANDOS
+#  🚨 EL RADAR DE 3 PASOS
+# ============================================================
+async def tarea_radar(context: ContextTypes.DEFAULT_TYPE):
+    if CHAT_ID is None or client_gemini is None: return
+    
+    prompt_gemini = "Actúa como analista de Wall Street. Resume en 3 líneas qué sectores (bancos, IA, cripto, petróleo) están en crisis o euforia HOY."
+    try:
+        response = client_gemini.models.generate_content(model='gemini-1.5-flash', contents=prompt_gemini)
+        contexto_noticias = response.text
+    except Exception:
+        contexto_noticias = "No hay noticias relevantes ahora."
+
+    movimientos_fuertes = []
+    for categoria, tickers in RADAR_TICKERS.items():
+        for ticker in tickers:
+            q = obtener_precio(ticker)
+            if q.get('c') != "N/D":
+                cambio = q.get("dp", 0)
+                umbral = 5.0 if "USD" in ticker else (1.5 if ticker in ["KBE", "^GSPC"] else 3.0)
+                if abs(cambio) >= umbral:
+                    movimientos_fuertes.append({"ticker": ticker, "precio": q.get('c'), "cambio": cambio, "categoria": categoria})
+
+    if movimientos_fuertes:
+        prompt_ds = f"Analiza estos movimientos: {json.dumps(movimientos_fuertes)}. Contexto: {contexto_noticias}. ¿Es oportunidad de trading?"
+        analisis_ds = consultar_deepseek(prompt_ds)
+        
+        mensaje = f"🚨 **¡RADAR DETECTADO!** 🚨\n\n🕵️‍♂️ *Contexto:*\n_{contexto_noticias}_\n\n📊 *Movimientos:*\n"
+        for m in movimientos_fuertes:
+            mensaje += f"{'📈' if m['cambio'] > 0 else '📉'} **{m['ticker']}**: ${m['precio']} ({m['cambio']:+.2f}%)\n"
+        mensaje += f"\n🧠 *Análisis:*\n{analisis_ds}"
+        await context.bot.send_message(chat_id=CHAT_ID, text=mensaje, parse_mode="Markdown")
+
+# ============================================================
+#  ▶️ COMANDOS Y ARRANQUE
 # ============================================================
 async def listo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CHAT_ID, job_vigilancia
@@ -230,7 +221,7 @@ async def listo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ahora = obtener_hora_local()
     proxima = ahora.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
     job_vigilancia = context.job_queue.run_repeating(tarea_radar, interval=3600, first=(proxima - ahora).total_seconds())
-    await update.message.reply_text("🚀 **¡Radar Gemini + DeepSeek Activado!**\nEscaneando mercado cada hora.")
+    await update.message.reply_text("🚀 **¡Radar Activado!**\nEscaneando el mercado cada hora.")
 
 async def parar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global job_vigilancia
@@ -259,6 +250,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("listo", listo))
     app.add_handler(CommandHandler("parar", parar))
     app.add_handler(CallbackQueryHandler(botones_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_ticker))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_texto))
     
-    app.run_polling()
+    # El drop_pending_updates arregla el problema de que no respondía
+    app.run_polling(drop_pending_updates=True)
