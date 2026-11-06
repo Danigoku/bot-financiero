@@ -1,5 +1,5 @@
 # ============================================================
-#  🤖 BOT FINANCIERO — VERSIÓN FINAL (GRÁFICOS Y DATOS BLINDADOS)
+#  🤖 BOT FINANCIERO — VERSIÓN FINAL (RADAR GEMINI + DEEPSEEK)
 # ============================================================
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
@@ -13,8 +13,9 @@ import yfinance as yf
 import mplfinance as mpf
 import matplotlib
 matplotlib.use('Agg')
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from google import genai
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.request import HTTPXRequest
 
 # ============================================================
@@ -23,106 +24,63 @@ from telegram.request import HTTPXRequest
 TOKEN_TELEGRAM = os.environ.get("TOKEN_TELEGRAM", "")
 API_KEY_DEEPSEEK = os.environ.get("API_KEY_DEEPSEEK", "")
 FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")
+API_KEY_GEMINI = os.environ.get("GEMINI_API_KEY", "")
+
+# Configurar cliente de Gemini
+client_gemini = genai.Client(api_key=API_KEY_GEMINI)
 
 # ============================================================
-#  ⚙️ CONFIGURACIÓN Y ZONA HORARIA (-6 CENTRAL)
+#  ⚙️ CONFIGURACIÓN Y DICCIONARIO
 # ============================================================
-TICKERS_VIGILAR = ["AAPL", "TSLA", "NVDA"]
-UMBRAL_CAMBIO_PCT = 3.0
 ZONA_HORARIA_OFFSET = -6 
+CHAT_ID = None
+job_vigilancia = None
+
+# Lista de Élite (Lo que el bot revisará si Gemini dice que hay movimiento)
+RADAR_TICKERS = {
+    "Índices": ["^GSPC", "^IXIC", "^DJI"],
+    "ETFs Top": ["SPY", "QQQ", "KBE", "XLE", "GLD"], # Mercado, Tech, Bancos, Energía, Oro
+    "Acciones": ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "JPM", "BAC"],
+    "Cripto": ["BTC-USD", "ETH-USD", "SOL-USD"],
+    "Materias Primas": ["CL=F", "GC=F"] # Petróleo, Oro
+}
+
+DICCIONARIO_TICKERS = {
+    "s&p 500": "^GSPC", "s&p": "^GSPC", "sp500": "^GSPC",
+    "nasdaq": "^IXIC", "dow jones": "^DJI",
+    "bitcoin": "BTC-USD", "btc": "BTC-USD", 
+    "ethereum": "ETH-USD", "solana": "SOL-USD",
+    "oro": "GC=F", "petroleo": "CL=F", 
+    "apple": "AAPL", "tesla": "TSLA", "nvidia": "NVDA", 
+    "bancos": "KBE"
+}
 
 def obtener_hora_local():
     tz = datetime.timezone(datetime.timedelta(hours=ZONA_HORARIA_OFFSET))
     return datetime.datetime.now(tz)
 
-CHAT_ID = None
-job_vigilancia = None
-job_sniper = None
-
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # ============================================================
-#  📊 FUNCIONES DE DATOS (BLINDADAS CONTRA ERRORES)
+#  📊 FUNCIONES DE DATOS Y ANÁLISIS
 # ============================================================
 def obtener_precio(ticker: str) -> dict:
-    # 1. Intentar con Yahoo Finance
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="2d")
         if not hist.empty:
             precio = hist['Close'].iloc[-1]
-            if not math.isnan(precio): # Verificar que no sea NaN
+            if not math.isnan(precio):
                 if len(hist) >= 2:
                     prev = hist['Close'].iloc[-2]
                     cambio = ((precio - prev) / prev) * 100
                     return {"c": round(float(precio), 2), "dp": round(float(cambio), 2)}
-                else:
-                    return {"c": round(float(precio), 2), "dp": 0.0}
-    except Exception as e:
-        logging.error(f"Error YFinance {ticker}: {e}")
-
-    # 2. Intentar con Finnhub como respaldo
-    try:
-        url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_KEY}"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("c") and data.get("c") > 0: # Si Finnhub devuelve un precio real
-            return data
-    except Exception as e:
-        logging.error(f"Error Finnhub {ticker}: {e}")
-    
-    # 3. Si todo falla, devolver N/D
+                return {"c": round(float(precio), 2), "dp": 0.0}
+    except Exception:
+        pass
     return {"c": "N/D", "dp": 0.0}
 
-def finnhub_noticias(ticker: str, limite: int = 3) -> list:
-    hoy = datetime.date.today()
-    desde = hoy - datetime.timedelta(days=7)
-    url = "https://finnhub.io/api/v1/company-news"
-    params = {"symbol": ticker, "from": desde.isoformat(), "to": hoy.isoformat(), "token": FINNHUB_KEY}
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        notis = r.json()[:limite]
-        return [f"- {n['headline']} ({n['source']})" for n in notis] or ["Sin noticias recientes."]
-    except Exception as e:
-        return ["No se pudieron cargar noticias."]
-
-# ============================================================
-#  📉 GENERADOR DE VELAS JAPONESAS (ARREGLADO)
-# ============================================================
-def generar_grafico_velas(ticker: str) -> str:
-    try:
-        # Usamos Ticker().history() en lugar de download() porque es más estable en servidores
-        t = yf.Ticker(ticker)
-        data = t.history(period="5d", interval="15m")
-        
-        # Si no hay datos (fin de semana o feriado), intentamos con datos diarios
-        if data.empty:
-            data = t.history(period="1mo", interval="1d")
-            
-        if data.empty: 
-            return None
-        
-        # ¡EL TRUCO! Quitamos la zona horaria del índice (mplfinance suele fallar por esto)
-        if data.index.tz is not None:
-            data.index = data.index.tz_localize(None)
-        
-        filename = f"{ticker}_chart.png"
-        mc = mpf.make_marketcolors(up='g', down='r', edge='inherit', wick='inherit', volume='in')
-        s  = mpf.make_mpf_style(marketcolors=mc, gridstyle=':', y_on_right=False)
-        
-        mpf.plot(data, type='candle', style=s, title=f'{ticker} - Velas Japonesas', 
-                 volume=True, savefig=filename)
-        return filename
-    except Exception as e:
-        logging.error(f"Error gráfico {ticker}: {e}")
-        return None
-
-# ============================================================
-#  🧠 FUNCIONES DE IA
-# ============================================================
-def consultar_deepseek(prompt: str, system_prompt: str = "Eres un analista financiero experto y amigable. Responde en español.") -> str:
+def consultar_deepseek(prompt: str, system_prompt: str = "Eres un analista financiero experto. Responde en español.") -> str:
     url = "https://api.deepseek.com/chat/completions"
     headers = {"Authorization": f"Bearer {API_KEY_DEEPSEEK}", "Content-Type": "application/json"}
     payload = {"model": "deepseek-chat", "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]}
@@ -130,227 +88,157 @@ def consultar_deepseek(prompt: str, system_prompt: str = "Eres un analista finan
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
-# ============================================================
-#  🎯 TAREA DEL MODO SNIPER
-# ============================================================
-async def tarea_sniper(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    chat_id = job.data["chat_id"]
-    tickers = job.data["tickers"]
-    
-    for ticker in tickers:
-        q = obtener_precio(ticker)
-        precio_actual = q.get("c")
-        if precio_actual == "N/D": continue
-        
-        precio_anterior = context.bot_data.get(f"precio_{ticker}", precio_actual)
-        
-        if precio_anterior != precio_actual:
-            cambio_rapido = ((precio_actual - precio_anterior) / precio_anterior) * 100
-            if abs(cambio_rapido) >= 0.5:
-                direccion = "📈 SUBIÓ" if cambio_rapido > 0 else "📉 BAJÓ"
-                mensaje = f"🚨 *¡Alerta Sniper en {ticker}!*\nEl precio {direccion} un *{cambio_rapido:.2f}%* en los últimos 3 min.\n💰 Precio: ${precio_actual}"
-                await context.bot.send_message(chat_id=chat_id, text=mensaje, parse_mode="Markdown")
-        context.bot_data[f"precio_{ticker}"] = precio_actual
-
-# ============================================================
-#  🧠 EL CEREBRO CENTRAL
-# ============================================================
-async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global job_sniper
-    texto = update.message.text
-    if texto.startswith('/'):
-        texto = texto.split(' ', 1)[1] if ' ' in texto else texto.replace('/', '')
-    if not texto.strip(): return
-
-    mensaje_espera = await update.message.reply_text("🤔 Analizando...")
-
-    system_prompt_clasificador = (
-        "Eres un clasificador de intenciones. Devuelve ÚNICAMENTE un objeto JSON válido. "
-        '{"accion": "noticias" | "precio" | "analisis_corto" | "analisis_largo" | "hora" | "reporte" | "grafico" | "sniper" | "cancelar_sniper" | "charla", '
-        '"ticker": "AAPL" o "null", "hora_texto": "19:30" o "null", "duracion_minutos": 120 o null}\n'
-        "REGLAS ESTRICTAS:\n"
-        "1. Traduce empresas a tickers (Samsung -> SSNLF, Apple -> AAPL).\n"
-        "2. PARA LA HORA (hora_texto): CONVIERTE SIEMPRE A FORMATO DE 24 HORAS. Si el usuario dice '7:30 de la tarde' o '7:30 pm', devuelve '19:30'. Si dice '9 am', devuelve '09:00'.\n"
-        "- 'grafico': SI DICE 'GRÁFICO', 'VELAS', 'IMAGEN', 'CHART'.\n"
-        "- 'sniper': si pide modo alerta o vigilancia (extrae 'duracion_minutos').\n"
-        "- 'cancelar_sniper': si pide apagar alerta.\n"
-        "- 'analisis_corto': trading.\n"
-        "- 'analisis_largo': inversión.\n"
-        "- 'precio': general.\n"
-        "- 'noticias': novedades.\n"
-        "- 'hora': hora actual.\n"
-        "- 'reporte': aviso a hora específica."
-    )
-
+def generar_grafico_velas(ticker: str, tiempo: str = "semana") -> str:
     try:
-        respuesta_json_str = consultar_deepseek(texto, system_prompt_clasificador)
-        respuesta_json_str = respuesta_json_str.replace("```json", "").replace("```", "").strip()
-        clasificacion = json.loads(respuesta_json_str)
+        t = yf.Ticker(ticker)
+        data = t.history(period="1d", interval="5m") if tiempo == "hoy" else t.history(period="5d", interval="15m")
+        if data.empty: return None
+        if data.index.tz is not None: data.index = data.index.tz_localize(None)
         
-        accion = clasificacion.get("accion")
-        ticker = clasificacion.get("ticker")
-        hora_texto = clasificacion.get("hora_texto")
-        duracion_minutos = clasificacion.get("duracion_minutos")
-
-        if accion == "sniper" and duracion_minutos:
-            if job_sniper: job_sniper.schedule_removal()
-            tickers_a_vigilar = [ticker] if ticker and ticker != "null" else TICKERS_VIGILAR
-            tiempo_fin = obtener_hora_local() + datetime.timedelta(minutes=duracion_minutos)
-            job_sniper = context.job_queue.run_repeating(
-                tarea_sniper, interval=180, first=10,
-                data={"chat_id": update.effective_chat.id, "tickers": tickers_a_vigilar}, last=tiempo_fin
-            )
-            await mensaje_espera.delete()
-            await update.message.reply_text(f"🎯 *¡Modo Sniper Activado!*\nVigilando: {', '.join(tickers_a_vigilar)}\nTiempo límite: {duracion_minutos} min (hasta las {tiempo_fin.strftime('%I:%M %p')}).", parse_mode="Markdown")
-            return
-
-        elif accion == "cancelar_sniper":
-            if job_sniper:
-                job_sniper.schedule_removal()
-                job_sniper = None
-                await mensaje_espera.delete()
-                await update.message.reply_text("🛑 Modo Sniper desactivado.")
-            return
-
-        elif accion == "hora":
-            ahora = obtener_hora_local().strftime("%I:%M %p")
-            await mensaje_espera.delete()
-            await update.message.reply_text(f"🕒 La hora actual es: {ahora} (Hora Central EE.UU.).")
-            return
-
-        elif accion == "reporte" and hora_texto:
-            try:
-                if ":" in hora_texto:
-                    h_str, m_str = hora_texto.split(":")
-                    h, m = int(h_str), int(m_str)
-                else: raise ValueError
-                
-                ahora = obtener_hora_local()
-                objetivo = ahora.replace(hour=h, minute=m, second=0, microsecond=0)
-                if objetivo < ahora: objetivo += datetime.timedelta(days=1)
-                
-                espera = (objetivo - ahora).total_seconds()
-                context.job_queue.run_once(tarea_reporte_agendado, when=espera, data={"chat_id": update.effective_chat.id, "ticker": ticker})
-                
-                await mensaje_espera.delete()
-                await update.message.reply_text(f"✅ ¡Entendido! Te mandaré el reporte a las {objetivo.strftime('%I:%M %p')}.")
-            except Exception:
-                await mensaje_espera.edit_text("❌ No entendí la hora. Intenta decir 'Avísame a las 19:30'.")
-            return
-
-        elif accion == "grafico" and ticker and ticker != "null":
-            await mensaje_espera.edit_text(f"📉 Generando velas japonesas de {ticker}...")
-            archivo_grafico = generar_grafico_velas(ticker)
-            if archivo_grafico:
-                await mensaje_espera.delete()
-                with open(archivo_grafico, 'rb') as photo:
-                    await update.message.reply_photo(photo=photo, caption=f"📊 Velas japonesas de {ticker}.")
-                os.remove(archivo_grafico)
-            else:
-                await mensaje_espera.edit_text("❌ No pude generar el gráfico. Es posible que el mercado esté cerrado o no haya datos disponibles para este ticker.")
-            return
-
-        elif accion == "noticias" and ticker and ticker != "null":
-            notis = finnhub_noticias(ticker, 3)
-            if notis and "No se pudieron cargar" not in notis[0]:
-                await mensaje_espera.delete()
-                await update.message.reply_text(f"📰 *Noticias de {ticker}:*\n\n" + "\n".join(notis), parse_mode="Markdown")
-                return
-            else:
-                resumen = consultar_deepseek(f"Resumen de noticias de {ticker}.")
-                await mensaje_espera.delete()
-                await update.message.reply_text(f"📰 *Noticias de {ticker} (IA):*\n\n{resumen}", parse_mode="Markdown")
-                return
-
-        elif accion in ["precio", "analisis_corto", "analisis_largo"] and ticker and ticker != "null":
-            q = obtener_precio(ticker)
-            
-            # Arreglo para el NaN
-            if q.get('c') == "N/D" or isinstance(q.get('c'), float) and math.isnan(q.get('c')):
-                await mensaje_espera.edit_text(f"❌ Lo siento, no hay datos de precio disponibles para {ticker} en este momento (puede ser que el mercado esté cerrado).")
-                return
-
-            notis = finnhub_noticias(ticker)
-            prompt = f"Analiza {ticker} a {accion.replace('analisis_', '')} plazo. Precio: {q.get('c')}, Cambio: {q.get('dp')}%. Noticias: {', '.join(notis)}."
-            analisis = consultar_deepseek(prompt)
-            await mensaje_espera.delete()
-            await update.message.reply_text(f"📊 *Análisis de {ticker}:*\n\n{analisis}", parse_mode="Markdown")
-            return
-
-        respuesta = consultar_deepseek(f"Responde amigablemente a esto: '{texto}'")
-        await mensaje_espera.delete()
-        await update.message.reply_text(respuesta)
-
-    except Exception as e:
-        logging.error(f"Error en procesar_mensaje: {e}")
-        await mensaje_espera.edit_text("❌ Tuve un problema al procesar tu mensaje.")
+        filename = f"{ticker.replace('^','')}_chart.png"
+        mc = mpf.make_marketcolors(up='g', down='r', edge='inherit', wick='inherit', volume='in')
+        s  = mpf.make_mpf_style(marketcolors=mc, gridstyle=':', y_on_right=False)
+        mpf.plot(data, type='candle', style=s, title=f'{ticker}', volume=True, savefig=filename)
+        return filename
+    except Exception:
+        return None
 
 # ============================================================
-#  🤖 TAREAS Y COMANDOS BÁSICOS
+#  🚨 EL RADAR DE 3 PASOS (Gemini + Filtro + DeepSeek)
 # ============================================================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 ¡Hola! Prueba con:\n"
-        "👉 _\"Gráfico de velas de Apple\"_\n"
-        "👉 _\"Análisis a corto plazo de Tesla\"_\n"
-        "👉 _\"Avísame de NVDA a las 19:30\"_\n"
-        "👉 _\"Ponte alerta por 2 horas\"_",
-        parse_mode="Markdown"
-    )
-
-async def tarea_reporte_agendado(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    chat_id = job.data["chat_id"]
-    ticker = job.data.get("ticker")
+async def tarea_radar(context: ContextTypes.DEFAULT_TYPE):
+    if CHAT_ID is None: return
     
-    if ticker and ticker != "null":
-        q = obtener_precio(ticker)
-        if q.get('c') == "N/D" or isinstance(q.get('c'), float) and math.isnan(q.get('c')):
-            await context.bot.send_message(chat_id=chat_id, text=f"⏰ *Reporte de {ticker}:* ❌ Datos no disponibles en este momento.", parse_mode="Markdown")
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=f"⏰ *Reporte programado de {ticker}:*\n📈 {ticker}: ${q.get('c')} ({q.get('dp'):+.2f}%)", parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id=chat_id, text="⏰ *Reporte General:*", parse_mode="Markdown")
-        for t in TICKERS_VIGILAR:
-            q = obtener_precio(t)
-            if q.get('c') != "N/D" and not math.isnan(q.get('c', 0)):
-                await context.bot.send_message(chat_id=chat_id, text=f"📈 {t}: ${q.get('c')} ({q.get('dp')}%)")
+    # PASO 1: Gemini investiga las noticias
+    prompt_gemini = (
+        "Actúa como un analista de Wall Street. Revisa las noticias financieras de HOY. "
+        "Dame un resumen ULTRA BREVE (máximo 3 líneas) de qué sectores están en crisis, euforia o moviéndose raro. "
+        "Menciona solo lo más importante (ej. bancos, IA, cripto, petróleo)."
+    )
+    
+    try:
+        response = client_gemini.models.generate_content(model='gemini-1.5-flash', contents=prompt_gemini)
+        contexto_noticias = response.text
+    except Exception as e:
+        logging.error(f"Error Gemini: {e}")
+        contexto_noticias = "No se pudieron cargar las noticias de última hora."
 
+    # PASO 2: Escanear la Lista de Élite (Yahoo Finance)
+    movimientos_fuertes = []
+    for categoria, tickers in RADAR_TICKERS.items():
+        for ticker in tickers:
+            q = obtener_precio(ticker)
+            if q.get('c') != "N/D":
+                cambio = q.get("dp", 0)
+                # Diferentes umbrales según el activo
+                umbral = 3.0 # Base para acciones e índices
+                if "USD" in ticker: umbral = 5.0 # Cripto se mueve más
+                if ticker in ["KBE", "^GSPC", "^IXIC"]: umbral = 1.5 # ETFs e índices se mueven menos
+                
+                if abs(cambio) >= umbral:
+                    movimientos_fuertes.append({
+                        "ticker": ticker, "precio": q.get('c'), "cambio": cambio, "categoria": categoria
+                    })
+
+    # PASO 3: DeepSeek analiza los movimientos
+    if movimientos_fuertes:
+        prompt_ds = (
+            f"El mercado tuvo estos movimientos fuertes: {json.dumps(movimientos_fuertes)}. "
+            f"Contexto de noticias (Gemini): {contexto_noticias}. "
+            "Dame un análisis breve y directo de si es oportunidad de trading (compra/venta) o riesgo de colapso."
+        )
+        analisis_ds = consultar_deepseek(prompt_ds)
+        
+        mensaje = "🚨🚨 **¡RADAR DE MERCADO DETECTADO!** 🚨🚨\n\n"
+        mensaje += f"🕵️‍♂️ *Contexto (Gemini):*\n_{contexto_noticias}_\n\n"
+        mensaje += "📊 *Movimientos Fuertes:*\n"
+        for m in movimientos_fuertes:
+            emoji = "📈" if m['cambio'] > 0 else "📉"
+            mensaje += f"{emoji} **{m['ticker']}** ({m['categoria']}): ${m['precio']} ({m['cambio']:+.2f}%)\n"
+            
+        mensaje += f"\n🧠 *Análisis (DeepSeek):*\n{analisis_ds}"
+        await context.bot.send_message(chat_id=CHAT_ID, text=mensaje, parse_mode="Markdown")
+
+# ============================================================
+#  🤖 EL MENÚ INTERACTIVO
+# ============================================================
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global CHAT_ID
+    CHAT_ID = update.effective_chat.id
+    await update.message.reply_text("📊 **Menú**\n¿De qué activo quieres saber? (Ej. *Apple, Bitcoin, S&P 500*)", parse_mode="Markdown")
+    context.user_data['esperando_ticker'] = True
+
+async def recibir_ticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('esperando_ticker'):
+        return 
+    
+    texto = update.message.text.lower().strip()
+    ticker = DICCIONARIO_TICKERS.get(texto, update.message.text.upper())
+    context.user_data['ticker_actual'] = ticker
+    context.user_data['esperando_ticker'] = False
+    
+    keyboard = [
+        [InlineKeyboardButton("📊 Gráfico Hoy", callback_data="grafico_hoy"), InlineKeyboardButton("📊 Gráfico Semana", callback_data="grafico_semana")],
+        [InlineKeyboardButton("📰 Noticias", callback_data="noticias"), InlineKeyboardButton("🧠 Análisis 360°", callback_data="analisis")]
+    ]
+    await update.message.reply_text(f"Has seleccionado: **{ticker}**\n¿Qué quieres hacer?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def botones_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    accion = query.data
+    ticker = context.user_data.get('ticker_actual', 'AAPL')
+    
+    if accion.startswith("grafico"):
+        tiempo = "hoy" if accion == "grafico_hoy" else "semana"
+        await query.edit_message_text(f"📉 Generando gráfico de {ticker}...")
+        archivo = generar_grafico_velas(ticker, tiempo)
+        if archivo:
+            with open(archivo, 'rb') as photo:
+                await query.message.reply_photo(photo=photo, caption=f"📊 Velas de {ticker}")
+            os.remove(archivo)
+            await query.delete_message()
+        else:
+            await query.edit_message_text("❌ No se pudo generar el gráfico.")
+            
+    elif accion == "noticias":
+        await query.edit_message_text(f"📰 Buscando noticias de {ticker}...")
+        # Aquí podríamos usar Gemini, pero por rapidez usamos DeepSeek
+        prompt = f"Dame un resumen de las noticias más recientes de {ticker}."
+        notis = consultar_deepseek(prompt)
+        await query.edit_message_text(f"📰 **Noticias de {ticker}:**\n\n{notis}", parse_mode="Markdown")
+        
+    elif accion == "analisis":
+        await query.edit_message_text(f"🧠 Analizando {ticker}...")
+        q = obtener_precio(ticker)
+        prompt = (
+            f"Analiza {ticker}. Precio: {q.get('c')}, Cambio hoy: {q.get('dp')}%. "
+            "ESTRUCTURA: 1. LO MÁS IMPORTANTE HOY. 2. LECTURA DE VELAS. 3. CORTO PLAZO (Predicción). 4. MEDIO PLAZO. 5. LARGO PLAZO."
+        )
+        analisis = consultar_deepseek(prompt)
+        await query.edit_message_text(f"🧠 **Análisis 360° de {ticker}:**\n\n{analisis}", parse_mode="Markdown")
+
+# ============================================================
+#  ▶️ ARRANQUE Y COMANDOS
+# ============================================================
 async def listo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CHAT_ID, job_vigilancia
     CHAT_ID = update.effective_chat.id
     if job_vigilancia is not None:
-        await update.message.reply_text("✅ Ya estoy vigilando.")
+        await update.message.reply_text("✅ El Radar ya está encendido.")
         return
     ahora = obtener_hora_local()
     proxima = ahora.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
-    seg = (proxima - ahora).total_seconds()
-    job_vigilancia = context.job_queue.run_repeating(tarea_vigilancia, interval=3600, first=seg)
-    await update.message.reply_text(f"🚀 ¡Listo! Próxima revisión: {proxima.strftime('%H:%M')}")
+    job_vigilancia = context.job_queue.run_repeating(tarea_radar, interval=3600, first=(proxima - ahora).total_seconds())
+    await update.message.reply_text("🚀 **¡Radar Gemini + DeepSeek Activado!**\nEscaneando mercado cada hora.")
 
 async def parar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global job_vigilancia
     if job_vigilancia is not None:
         job_vigilancia.schedule_removal()
         job_vigilancia = None
-    await update.message.reply_text("🛑 Vigilancia detenida.")
+    await update.message.reply_text("🛑 Radar detenido.")
 
-async def tarea_vigilancia(context: ContextTypes.DEFAULT_TYPE):
-    if CHAT_ID is None: return
-    alertas = []
-    for t in TICKERS_VIGILAR:
-        q = obtener_precio(t)
-        if q.get('c') != "N/D" and not math.isnan(q.get('c', 0)):
-            cambio = q.get("dp", 0)
-            if cambio >= UMBRAL_CAMBIO_PCT: alertas.append(f"🔴 *VENDER* {t} — subió {cambio:.2f}%")
-            elif cambio <= -UMBRAL_CAMBIO_PCT: alertas.append(f"🟢 *COMPRAR* {t} — cayó {cambio:.2f}%")
-    msg = ("📢 *Señales:*\n\n" + "\n".join(alertas)) if alertas else "✅ Sin señales fuertes."
-    await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
-
-# ============================================================
-#  ▶️ ARRANQUE
-# ============================================================
 class WebHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -364,14 +252,13 @@ def iniciar_servidor():
 
 if __name__ == "__main__":
     iniciar_servidor()
-    print("🤖 Bot encendido en Render.")
-    
     req = HTTPXRequest(read_timeout=30.0, connect_timeout=15.0)
     app = Application.builder().token(TOKEN_TELEGRAM).request(req).get_updates_request(req).build()
     
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("listo", listo))
     app.add_handler(CommandHandler("parar", parar))
-    app.add_handler(MessageHandler(filters.TEXT, procesar_mensaje))
+    app.add_handler(CallbackQueryHandler(botones_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_ticker))
     
     app.run_polling()
