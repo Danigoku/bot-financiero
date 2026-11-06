@@ -425,4 +425,11 @@ if __name__ == "__main__":
     req = HTTPXRequest(read_timeout=30.0, connect_timeout=15.0)
     
     # Construimos la app llamando a 'post_init' al arrancar
-    app
+    app = Application.builder().token(TOKEN_TELEGRAM).request(req).get_updates_request(req).post_init(post_init).build()
+    
+    app.add_handler(CommandHandler("menu", manejar_mensaje))
+    app.add_handler(CommandHandler("estado", manejar_mensaje))
+    app.add_handler(CallbackQueryHandler(manejar_botones))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_mensaje))
+    
+    app.run_polling(drop_pending_updates=True)
